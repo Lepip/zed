@@ -91,6 +91,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Extensions", zed_actions::Extensions::default()),
+                MenuItem::action("Zed API", zed_actions::OpenZedApi),
                 #[cfg(not(target_os = "windows"))]
                 MenuItem::action("Install CLI", install_cli::InstallCliBinary),
                 MenuItem::separator(),
@@ -330,4 +331,36 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             ],
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{MenuItem, TestAppContext};
+
+    #[gpui::test]
+    async fn test_zed_api_menu_item_is_grouped_with_extensions(cx: &mut TestAppContext) {
+        let menus = cx.update(|cx| app_menus(cx));
+        let zed_menu = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "Zed")
+            .expect("Zed menu should exist");
+
+        let extensions_idx = zed_menu
+            .items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action { name, .. } if name.as_ref() == "Extensions"))
+            .expect("Extensions menu item should exist");
+        let zed_api_idx = zed_menu
+            .items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action { name, .. } if name.as_ref() == "Zed API"))
+            .expect("Zed API menu item should exist");
+
+        assert_eq!(
+            zed_api_idx,
+            extensions_idx + 1,
+            "Zed API should be directly under Extensions"
+        );
+    }
 }

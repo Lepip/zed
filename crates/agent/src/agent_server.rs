@@ -1,15 +1,19 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 
 use agent_client_protocol::schema as acp;
+use acp_thread::{AgentThreadEntry, AssistantMessageChunk};
 use anyhow::{Context, Result};
 use collections::HashMap;
 use fs::Fs;
 use gpui::{App, AsyncApp, Entity};
 use language_model::{LanguageModelRegistry, SelectedModel};
+use parking_lot::Mutex;
 use project::Project;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Response, Server};
@@ -25,6 +29,52 @@ pub struct AgentHttpServerConfig {
 impl Default for AgentHttpServerConfig {
     fn default() -> Self {
         Self { port: 8765 }
+    }
+}
+
+const DEFAULT_AGENT_HTTP_PORT: u16 = 8765;
+const MAX_RECENT_HTTP_REQUESTS: usize = 200;
+
+static AGENT_HTTP_PORT: AtomicU16 = AtomicU16::new(DEFAULT_AGENT_HTTP_PORT);
+static AGENT_HTTP_REQUESTS: LazyLock<Mutex<std::collections::VecDeque<AgentHttpRequestLogEntry>>> =
+    LazyLock::new(|| Mutex::new(std::collections::VecDeque::with_capacity(MAX_RECENT_HTTP_REQUESTS)));
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHttpRequestLogEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub method: String,
+    pub path: String,
+    pub status_code: u16,
+}
+
+pub fn configured_agent_http_port() -> u16 {
+    AGENT_HTTP_PORT.load(Ordering::Relaxed)
+}
+
+pub fn set_configured_agent_http_port(port: u16) {
+    AGENT_HTTP_PORT.store(port, Ordering::Relaxed);
+}
+
+pub fn recent_agent_http_requests(limit: usize) -> Vec<AgentHttpRequestLogEntry> {
+    let requests = AGENT_HTTP_REQUESTS.lock();
+    requests
+        .iter()
+        .rev()
+        .take(limit.min(requests.len()))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn log_agent_http_request(method: &str, path: &str, status_code: u16) {
+    let mut requests = AGENT_HTTP_REQUESTS.lock();
+    requests.push_back(AgentHttpRequestLogEntry {
+        timestamp: chrono::Utc::now(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status_code,
+    });
+    while requests.len() > MAX_RECENT_HTTP_REQUESTS {
+        requests.pop_front();
     }
 }
 
@@ -83,6 +133,7 @@ pub struct PromptResponse {
     pub stop_reason: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +143,7 @@ pub struct AgentStatusResponse {
     pub workdir: String,
     pub entry_count: usize,
     pub status: String,
+    pub current_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,18 +157,25 @@ pub fn start_agent_http_server(
     fs: Arc<dyn Fs>,
     cx: &mut App,
 ) -> Option<AgentHttpServerHandle> {
+    let requested_port = if config.port == DEFAULT_AGENT_HTTP_PORT {
+        configured_agent_http_port()
+    } else {
+        config.port
+    };
+
     let (commands_tx, commands_rx) = async_channel::unbounded::<AgentServerCommand>();
     let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
     let (ns_tx, ns_rx) = async_channel::unbounded::<(acp::SessionId, PathBuf, Option<String>)>();
     let (su_tx, su_rx) = async_channel::unbounded::<acp::SessionId>();
 
-    let listener = match TcpListener::bind(format!("0.0.0.0:{}", config.port)) {
+    let listener = match TcpListener::bind(format!("0.0.0.0:{}", requested_port)) {
         Ok(l) => l,
         Err(e) => {
-            log::warn!("Failed to bind :{}: {e}", config.port);
+            log::warn!("Failed to bind :{}: {e}", requested_port);
             return None;
         }
     };
+    set_configured_agent_http_port(requested_port);
     let commands_tx_for_thread = commands_tx.clone();
     let addr = listener.local_addr().ok();
 
@@ -173,9 +232,16 @@ fn route_request(
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
     let route = parse_route(&url);
+    let path = url.split('?').next().unwrap_or(&url).to_string();
     match (method.as_str(), route) {
-        ("OPTIONS", _) => handle_preflight(request),
-        ("GET", Route::Healthz) => respond_text(request, 200, "ok"),
+        ("OPTIONS", _) => {
+            handle_preflight(request);
+            log_agent_http_request(&method, &path, 204);
+        }
+        ("GET", Route::Healthz) => {
+            respond_text(request, 200, "ok");
+            log_agent_http_request(&method, &path, 200);
+        }
         ("POST", Route::Agents) => {
             let body = read_body(&mut request);
             let (reply, rx) = async_channel::bounded(1);
@@ -186,30 +252,42 @@ fn route_request(
                         reply,
                     });
                     match rx.recv_blocking() {
-                        Ok(Ok(r)) => respond_json(request, 200, &r),
-                        Ok(Err(e)) => respond_json(
-                            request,
-                            500,
-                            &ErrorBody {
-                                error: format!("{e:#}"),
-                            },
-                        ),
-                        Err(_) => respond_json(
-                            request,
-                            500,
-                            &ErrorBody {
-                                error: "no response".into(),
-                            },
-                        ),
+                        Ok(Ok(r)) => {
+                            respond_json(request, 200, &r);
+                            log_agent_http_request(&method, &path, 200);
+                        }
+                        Ok(Err(e)) => {
+                            respond_json(
+                                request,
+                                500,
+                                &ErrorBody {
+                                    error: format!("{e:#}"),
+                                },
+                            );
+                            log_agent_http_request(&method, &path, 500);
+                        }
+                        Err(_) => {
+                            respond_json(
+                                request,
+                                500,
+                                &ErrorBody {
+                                    error: "no response".into(),
+                                },
+                            );
+                            log_agent_http_request(&method, &path, 500);
+                        }
                     }
                 }
-                Err(e) => respond_json(
-                    request,
-                    400,
-                    &ErrorBody {
-                        error: format!("Invalid: {e}"),
-                    },
-                ),
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        &ErrorBody {
+                            error: format!("Invalid: {e}"),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 400);
+                }
             }
         }
         ("POST", Route::AgentPrompt(sid)) => {
@@ -223,30 +301,42 @@ fn route_request(
                         reply,
                     });
                     match rx.recv_blocking() {
-                        Ok(Ok(r)) => respond_json(request, 200, &r),
-                        Ok(Err(e)) => respond_json(
-                            request,
-                            500,
-                            &ErrorBody {
-                                error: format!("{e:#}"),
-                            },
-                        ),
-                        Err(_) => respond_json(
-                            request,
-                            500,
-                            &ErrorBody {
-                                error: "no response".into(),
-                            },
-                        ),
+                        Ok(Ok(r)) => {
+                            respond_json(request, 200, &r);
+                            log_agent_http_request(&method, &path, 200);
+                        }
+                        Ok(Err(e)) => {
+                            respond_json(
+                                request,
+                                500,
+                                &ErrorBody {
+                                    error: format!("{e:#}"),
+                                },
+                            );
+                            log_agent_http_request(&method, &path, 500);
+                        }
+                        Err(_) => {
+                            respond_json(
+                                request,
+                                500,
+                                &ErrorBody {
+                                    error: "no response".into(),
+                                },
+                            );
+                            log_agent_http_request(&method, &path, 500);
+                        }
                     }
                 }
-                Err(e) => respond_json(
-                    request,
-                    400,
-                    &ErrorBody {
-                        error: format!("Invalid: {e}"),
-                    },
-                ),
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        &ErrorBody {
+                            error: format!("Invalid: {e}"),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 400);
+                }
             }
         }
         ("GET", Route::Agent(sid)) => {
@@ -256,21 +346,30 @@ fn route_request(
                 reply,
             });
             match rx.recv_blocking() {
-                Ok(Ok(r)) => respond_json(request, 200, &r),
-                Ok(Err(e)) => respond_json(
-                    request,
-                    500,
-                    &ErrorBody {
-                        error: format!("{e:#}"),
-                    },
-                ),
-                Err(_) => respond_json(
-                    request,
-                    500,
-                    &ErrorBody {
-                        error: "no response".into(),
-                    },
-                ),
+                Ok(Ok(r)) => {
+                    respond_json(request, 200, &r);
+                    log_agent_http_request(&method, &path, 200);
+                }
+                Ok(Err(e)) => {
+                    respond_json(
+                        request,
+                        500,
+                        &ErrorBody {
+                            error: format!("{e:#}"),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 500);
+                }
+                Err(_) => {
+                    respond_json(
+                        request,
+                        500,
+                        &ErrorBody {
+                            error: "no response".into(),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 500);
+                }
             }
         }
         ("DELETE", Route::Agent(sid)) => {
@@ -280,30 +379,42 @@ fn route_request(
                 reply,
             });
             match rx.recv_blocking() {
-                Ok(Ok(())) => respond_json(request, 200, &serde_json::json!({"status": "closed"})),
-                Ok(Err(e)) => respond_json(
-                    request,
-                    500,
-                    &ErrorBody {
-                        error: format!("{e:#}"),
-                    },
-                ),
-                Err(_) => respond_json(
-                    request,
-                    500,
-                    &ErrorBody {
-                        error: "no response".into(),
-                    },
-                ),
+                Ok(Ok(())) => {
+                    respond_json(request, 200, &serde_json::json!({"status": "closed"}));
+                    log_agent_http_request(&method, &path, 200);
+                }
+                Ok(Err(e)) => {
+                    respond_json(
+                        request,
+                        500,
+                        &ErrorBody {
+                            error: format!("{e:#}"),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 500);
+                }
+                Err(_) => {
+                    respond_json(
+                        request,
+                        500,
+                        &ErrorBody {
+                            error: "no response".into(),
+                        },
+                    );
+                    log_agent_http_request(&method, &path, 500);
+                }
             }
         }
-        _ => respond_json(
-            request,
-            404,
-            &ErrorBody {
-                error: "Not found".into(),
-            },
-        ),
+        _ => {
+            respond_json(
+                request,
+                404,
+                &ErrorBody {
+                    error: "Not found".into(),
+                },
+            );
+            log_agent_http_request(&method, &path, 404);
+        }
     }
 }
 
@@ -369,6 +480,33 @@ fn handle_preflight(request: tiny_http::Request) {
         )
         .with_header(Header::from_str("Access-Control-Allow-Headers: Content-Type").unwrap());
     request.respond(response).ok();
+}
+
+fn normalize_output_chunks(chunks: impl Iterator<Item = String>) -> Option<String> {
+    let output = chunks
+        .filter_map(|chunk| {
+            let trimmed = chunk.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn latest_assistant_output(thread: &acp_thread::AcpThread, cx: &App) -> Option<String> {
+    thread.entries().iter().rev().find_map(|entry| {
+        let AgentThreadEntry::AssistantMessage(message) = entry else {
+            return None;
+        };
+
+        normalize_output_chunks(message.chunks.iter().map(|chunk| {
+            let block = match chunk {
+                AssistantMessageChunk::Message { block } => block,
+                AssistantMessageChunk::Thought { block } => block,
+            };
+            block.to_markdown(cx).to_string()
+        }))
+    })
 }
 
 async fn run_command_loop(
@@ -524,6 +662,7 @@ async fn run_command_loop(
                 };
 
                 let res = fut.await;
+                let output = acp.read_with(cx, |t, cx| latest_assistant_output(t, cx));
                 let resp = match res {
                     Ok(Some(r)) => {
                         let u = acp.read_with(cx, |t, _| {
@@ -532,6 +671,7 @@ async fn run_command_loop(
                                 stop_reason: Some(format!("{:?}", r.stop_reason)),
                                 input_tokens: Some(u.input_tokens),
                                 output_tokens: Some(u.output_tokens),
+                                output: output.clone(),
                             })
                         });
                         u.unwrap_or(PromptResponse {
@@ -539,6 +679,7 @@ async fn run_command_loop(
                             stop_reason: Some(format!("{:?}", r.stop_reason)),
                             input_tokens: None,
                             output_tokens: None,
+                            output: output.clone(),
                         })
                     }
                     Ok(None) => PromptResponse {
@@ -546,6 +687,7 @@ async fn run_command_loop(
                         stop_reason: Some("completed".into()),
                         input_tokens: None,
                         output_tokens: None,
+                        output: output.clone(),
                     },
                     Err(e) => {
                         reply
@@ -581,12 +723,14 @@ async fn run_command_loop(
                         .context("Session not loaded")?;
                     let (ec, st) =
                         acp.read_with(cx, |t, _| (t.entries().len(), format!("{:?}", t.status())));
+                    let current_output = acp.read_with(cx, |t, cx| latest_assistant_output(t, cx));
                     Ok(AgentStatusResponse {
                         session_id: session_id.clone(),
                         model: meta.model.clone(),
                         workdir: meta.workdir.display().to_string(),
                         entry_count: ec,
                         status: st,
+                        current_output,
                     })
                 });
                 reply.send(r).await.ok();
@@ -598,5 +742,58 @@ async fn run_command_loop(
                 reply.send(Ok(())).await.ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn test_normalize_output_chunks_joins_non_empty_segments() {
+        let output = normalize_output_chunks(
+            vec![
+                "  hello  ".to_string(),
+                "".to_string(),
+                "  ".to_string(),
+                "\nworld\n".to_string(),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(output.as_deref(), Some("hello\n\nworld"));
+    }
+
+    #[test]
+    fn test_normalize_output_chunks_returns_none_for_empty_content() {
+        let output =
+            normalize_output_chunks(vec!["".to_string(), "   ".to_string()].into_iter());
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn test_recent_requests_are_capped_and_newest_first() {
+        let _guard = TEST_MUTEX.lock();
+        AGENT_HTTP_REQUESTS.lock().clear();
+
+        for i in 0..(MAX_RECENT_HTTP_REQUESTS + 10) {
+            log_agent_http_request("GET", &format!("/r/{i}"), 200);
+        }
+
+        let recent = recent_agent_http_requests(MAX_RECENT_HTTP_REQUESTS);
+        assert_eq!(recent.len(), MAX_RECENT_HTTP_REQUESTS);
+        assert_eq!(recent[0].path, format!("/r/{}", MAX_RECENT_HTTP_REQUESTS + 9));
+        assert_eq!(recent[recent.len() - 1].path, "/r/10");
+    }
+
+    #[test]
+    fn test_configured_port_round_trip() {
+        let _guard = TEST_MUTEX.lock();
+        let original = configured_agent_http_port();
+        set_configured_agent_http_port(9911);
+        assert_eq!(configured_agent_http_port(), 9911);
+        set_configured_agent_http_port(original);
     }
 }
