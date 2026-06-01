@@ -27,6 +27,32 @@ struct HealthStatus {
     message: SharedString,
 }
 
+fn parse_port_input(text: &str) -> Result<u16, SharedString> {
+    let port = text
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "Port must be a valid number".to_string())?;
+    if port == 0 {
+        return Err("Port must be greater than 0".into());
+    }
+    Ok(port)
+}
+
+fn classify_health_response(port: u16, response: &str) -> HealthStatus {
+    if response.contains("200") && response.to_lowercase().contains("ok") {
+        HealthStatus {
+            ok: true,
+            message: format!("Healthy on :{port}").into(),
+        }
+    } else {
+        let headline = response.lines().next().unwrap_or("Unexpected response");
+        HealthStatus {
+            ok: false,
+            message: format!("Health check failed: {headline}").into(),
+        }
+    }
+}
+
 pub struct ZedApiView {
     focus_handle: FocusHandle,
     port_editor: Entity<Editor>,
@@ -53,14 +79,7 @@ impl ZedApiView {
 
     fn selected_port(&self, cx: &App) -> Result<u16, SharedString> {
         let text = self.port_editor.read(cx).text(cx);
-        let port = text
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| "Port must be a valid number".to_string())?;
-        if port == 0 {
-            return Err("Port must be greater than 0".into());
-        }
-        Ok(port)
+        parse_port_input(&text)
     }
 
     fn apply_port(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -116,17 +135,8 @@ impl ZedApiView {
                             ok: false,
                             message: "No response received from API".into(),
                         }
-                    } else if response.contains("200") && response.to_lowercase().contains("ok") {
-                        HealthStatus {
-                            ok: true,
-                            message: format!("Healthy on :{port}").into(),
-                        }
                     } else {
-                        let headline = response.lines().next().unwrap_or("Unexpected response");
-                        HealthStatus {
-                            ok: false,
-                            message: format!("Health check failed: {headline}").into(),
-                        }
+                        classify_health_response(port, &response)
                     }
                 }
             }
@@ -240,5 +250,46 @@ impl Render for ZedApiView {
                             )
                     })),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_port_input_accepts_valid_port() {
+        assert_eq!(parse_port_input(" 8765 "), Ok(8765));
+    }
+
+    #[test]
+    fn test_parse_port_input_rejects_invalid_number() {
+        let error = parse_port_input("abc").expect_err("invalid text should fail");
+        assert_eq!(error.as_ref(), "Port must be a valid number");
+    }
+
+    #[test]
+    fn test_parse_port_input_rejects_zero() {
+        let error = parse_port_input("0").expect_err("zero should fail");
+        assert_eq!(error.as_ref(), "Port must be greater than 0");
+    }
+
+    #[test]
+    fn test_classify_health_response_success() {
+        let status = classify_health_response(8765, "HTTP/1.1 200 OK\r\n\r\nok");
+        assert!(status.ok);
+        assert_eq!(status.message.as_ref(), "Healthy on :8765");
+    }
+
+    #[test]
+    fn test_classify_health_response_failure_uses_headline() {
+        let status = classify_health_response(8765, "HTTP/1.1 503 Service Unavailable\r\n\r\nnope");
+        assert!(!status.ok);
+        assert!(
+            status
+                .message
+                .as_ref()
+                .starts_with("Health check failed: HTTP/1.1 503 Service Unavailable")
+        );
     }
 }

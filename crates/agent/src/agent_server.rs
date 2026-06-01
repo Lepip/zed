@@ -482,27 +482,30 @@ fn handle_preflight(request: tiny_http::Request) {
     request.respond(response).ok();
 }
 
+fn normalize_output_chunks(chunks: impl Iterator<Item = String>) -> Option<String> {
+    let output = chunks
+        .filter_map(|chunk| {
+            let trimmed = chunk.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!output.trim().is_empty()).then_some(output)
+}
+
 fn latest_assistant_output(thread: &acp_thread::AcpThread, cx: &App) -> Option<String> {
     thread.entries().iter().rev().find_map(|entry| {
         let AgentThreadEntry::AssistantMessage(message) = entry else {
             return None;
         };
 
-        let output = message
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                let block = match chunk {
-                    AssistantMessageChunk::Message { block } => block,
-                    AssistantMessageChunk::Thought { block } => block,
-                };
-                let text = block.to_markdown(cx).to_string();
-                (!text.trim().is_empty()).then_some(text)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        (!output.trim().is_empty()).then_some(output)
+        normalize_output_chunks(message.chunks.iter().map(|chunk| {
+            let block = match chunk {
+                AssistantMessageChunk::Message { block } => block,
+                AssistantMessageChunk::Thought { block } => block,
+            };
+            block.to_markdown(cx).to_string()
+        }))
     })
 }
 
@@ -739,5 +742,58 @@ async fn run_command_loop(
                 reply.send(Ok(())).await.ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn test_normalize_output_chunks_joins_non_empty_segments() {
+        let output = normalize_output_chunks(
+            vec![
+                "  hello  ".to_string(),
+                "".to_string(),
+                "  ".to_string(),
+                "\nworld\n".to_string(),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(output.as_deref(), Some("hello\n\nworld"));
+    }
+
+    #[test]
+    fn test_normalize_output_chunks_returns_none_for_empty_content() {
+        let output =
+            normalize_output_chunks(vec!["".to_string(), "   ".to_string()].into_iter());
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn test_recent_requests_are_capped_and_newest_first() {
+        let _guard = TEST_MUTEX.lock();
+        AGENT_HTTP_REQUESTS.lock().clear();
+
+        for i in 0..(MAX_RECENT_HTTP_REQUESTS + 10) {
+            log_agent_http_request("GET", &format!("/r/{i}"), 200);
+        }
+
+        let recent = recent_agent_http_requests(MAX_RECENT_HTTP_REQUESTS);
+        assert_eq!(recent.len(), MAX_RECENT_HTTP_REQUESTS);
+        assert_eq!(recent[0].path, format!("/r/{}", MAX_RECENT_HTTP_REQUESTS + 9));
+        assert_eq!(recent[recent.len() - 1].path, "/r/10");
+    }
+
+    #[test]
+    fn test_configured_port_round_trip() {
+        let _guard = TEST_MUTEX.lock();
+        let original = configured_agent_http_port();
+        set_configured_agent_http_port(9911);
+        assert_eq!(configured_agent_http_port(), 9911);
+        set_configured_agent_http_port(original);
     }
 }
