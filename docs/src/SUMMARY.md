@@ -25,6 +25,7 @@
   - [Agent Settings](./ai/agent-settings.md)
 - [Models](./ai/models.md)
 - [Providers](./ai/llm-providers.md)
+- [Zed HTTP Agent API](./ai/zed-http-agent-api.md)
 
 # Working with Code
 
